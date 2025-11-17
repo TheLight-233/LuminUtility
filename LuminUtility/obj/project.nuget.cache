@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "j2ykk8xnOt4=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\xiaoxi\\RiderProjects\\LuminUtility\\LuminUtility\\LuminUtility.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\xiaoxi\\.nuget\\packages\\system.runtime.compilerservices.unsafe\\6.1.2\\system.runtime.compilerservices.unsafe.6.1.2.nupkg.sha512",
+    "C:\\Users\\xiaoxi\\.nuget\\packages\\microsoft.netcore.app.ref\\8.0.20\\microsoft.netcore.app.ref.8.0.20.nupkg.sha512",
+    "C:\\Users\\xiaoxi\\.nuget\\packages\\microsoft.windowsdesktop.app.ref\\8.0.20\\microsoft.windowsdesktop.app.ref.8.0.20.nupkg.sha512",
+    "C:\\Users\\xiaoxi\\.nuget\\packages\\microsoft.aspnetcore.app.ref\\8.0.20\\microsoft.aspnetcore.app.ref.8.0.20.nupkg.sha512"
+  ],
+  "logs": []
+}
