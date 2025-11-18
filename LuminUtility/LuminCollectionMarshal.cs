@@ -209,7 +209,6 @@ public sealed class LuminCollectionMarshal
     {
         public int[] _buckets;
         public Entry[] _entries;
-        public ulong _fastModMultiplier;
         public int _count;
         public int _version;
         public int _freeList;
@@ -217,10 +216,11 @@ public sealed class LuminCollectionMarshal
         public IEqualityComparer<TKey> _comparer;
         public Dictionary<TKey, TValue>.KeyCollection _keys;
         public Dictionary<TKey, TValue>.ValueCollection _values;
+        public object _syncRoot;
         
         public struct Entry
         {
-            public int HashCode;
+            public uint HashCode;
             public int Next;
             public TKey Key;
             public TValue Value;
@@ -231,13 +231,12 @@ public sealed class LuminCollectionMarshal
     {
         public int[] _buckets;
         public Entry[] _entries;
-        private ulong _fastModMultiplier;
         public int _count;
         public int _version;
         public int _freeList;
         public int _freeCount;
         public IEqualityComparer<T> _comparer;
-        
+        public object _syncRoot;
         
         public struct Entry
         {
@@ -251,56 +250,86 @@ public sealed class LuminCollectionMarshal
 public static class DictionaryExtensions
 {
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static ref TValue GetValueRefOrAddDefault<TKey, TValue, TAlternateKey>(
+    public static ref TValue GetValueRefOrAddDefault<TKey, TValue>(
         this Dictionary<TKey, TValue> dictionary,
-        TAlternateKey key,
-        out bool exists,
-        IAlternateEqualityComparer<TAlternateKey, TKey> alternateComparer)
+        TKey key,
+        out bool exists)
         where TKey : notnull
     {
         if (dictionary == null)
             throw new ArgumentNullException(nameof(dictionary));
-        if (alternateComparer == null)
-            throw new ArgumentNullException(nameof(alternateComparer));
+        
+        return ref GetValueRefOrAddDefaultFallback(dictionary, key, out exists);
+    }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ref TValue GetValueRefOrAddDefaultFallback<TKey, TValue>(
+        Dictionary<TKey, TValue> dictionary,
+        TKey key,
+        out bool exists)
+        where TKey : notnull
+    {
         var view = LuminCollectionMarshal.GetDictionaryView(dictionary);
         
         if (view._buckets == null)
         {
             InitializeDictionary(dictionary, 0);
-            view = LuminCollectionMarshal.GetDictionaryView(dictionary); // 重新获取视图
+            view = LuminCollectionMarshal.GetDictionaryView(dictionary);
         }
-
+        
+        var comparer = view._comparer;
         var entries = view._entries;
-        uint hashCode = (uint)alternateComparer.GetHashCode(key);
+        
+        uint hashCode = !typeof(TKey).IsValueType || comparer != null 
+            ? (uint)comparer.GetHashCode(key) 
+            : (uint)key.GetHashCode();
+        
         uint collisionCount = 0;
         
         ref int bucket = ref GetBucketRef(view, hashCode);
         int index = bucket - 1;
         
-        while ((uint)index < (uint)entries.Length)
+        if (typeof(TKey).IsValueType && comparer == null)
         {
-            if (entries[index].HashCode == hashCode && 
-                alternateComparer.Equals(key, entries[index].Key))
+            while ((uint)index < (uint)entries.Length)
             {
-                exists = true;
-                return ref entries[index].Value;
+                ref var entry = ref entries[index];
+                if (entry.HashCode == hashCode && 
+                    EqualityComparer<TKey>.Default.Equals(entry.Key, key))
+                {
+                    exists = true;
+                    return ref entry.Value;
+                }
+                index = entry.Next;
+                collisionCount++;
+                
+                if (collisionCount > (uint)entries.Length)
+                {
+                    throw new InvalidOperationException("Concurrent operations are not supported.");
+                }
             }
-            index = entries[index].Next;
-            collisionCount++;
-            
-            if (collisionCount > (uint)entries.Length)
+        }
+        else
+        {
+            while ((uint)index < (uint)entries.Length)
             {
-                throw new InvalidOperationException("Concurrent operations are not supported.");
+                ref var entry = ref entries[index];
+                if (entry.HashCode == hashCode && 
+                    comparer.Equals(entry.Key, key))
+                {
+                    exists = true;
+                    return ref entry.Value;
+                }
+                index = entry.Next;
+                collisionCount++;
+                
+                if (collisionCount > (uint)entries.Length)
+                {
+                    throw new InvalidOperationException("Concurrent operations are not supported.");
+                }
             }
         }
         
-        TKey newKey = alternateComparer.Create(key);
-        if (newKey == null)
-        {
-            throw new ArgumentNullException("key");
-        }
-
         int newIndex;
         if (view._freeCount > 0)
         {
@@ -313,7 +342,6 @@ public static class DictionaryExtensions
             int count = view._count;
             if (count == entries.Length)
             {
-                
                 ResizeDictionary(dictionary);
                 view = LuminCollectionMarshal.GetDictionaryView(dictionary);
                 entries = view._entries;
@@ -323,25 +351,24 @@ public static class DictionaryExtensions
             view._count = count + 1;
         }
         
-        ref var entry = ref entries[newIndex];
-        entry.HashCode = (int)hashCode;
-        entry.Next = bucket - 1;
-        entry.Key = newKey;
-        entry.Value = default!;
+        ref var newEntry = ref entries[newIndex];
+        newEntry.HashCode = hashCode;
+        newEntry.Next = bucket - 1;
+        newEntry.Key = key;
+        newEntry.Value = default!;
         bucket = newIndex + 1;
         view._version++;
         
-        if (!typeof(TKey).IsValueType && collisionCount > 100 && 
-            alternateComparer is NonRandomizedStringEqualityComparer)
+        if (!typeof(TKey).IsValueType && collisionCount > 100)
         {
             ResizeDictionary(dictionary, entries.Length, true);
             view = LuminCollectionMarshal.GetDictionaryView(dictionary);
             exists = false;
-            return ref FindValue(dictionary, newKey);
+            return ref FindValue(dictionary, key);
         }
 
         exists = false;
-        return ref entry.Value;
+        return ref newEntry.Value;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -350,17 +377,8 @@ public static class DictionaryExtensions
         uint hashCode)
         where TKey : notnull
     {
-        if (view._fastModMultiplier != 0)
-        {
-            uint bucketCount = (uint)view._buckets.Length;
-            uint bucket = (uint)((hashCode * view._fastModMultiplier) >> 32) & (bucketCount - 1);
-            return ref view._buckets[bucket];
-        }
-        else
-        {
-            uint bucket = hashCode % (uint)view._buckets.Length;
-            return ref view._buckets[bucket];
-        }
+        uint bucket = hashCode % (uint)view._buckets.Length;
+        return ref view._buckets[bucket];
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -370,19 +388,22 @@ public static class DictionaryExtensions
         var view = LuminCollectionMarshal.GetDictionaryView(dictionary);
         var entries = view._entries;
         var comparer = view._comparer;
-        uint hashCode = (uint)comparer.GetHashCode(key);
+        uint hashCode = !typeof(TKey).IsValueType || comparer != null 
+            ? (uint)comparer.GetHashCode(key) 
+            : (uint)key.GetHashCode();
         
         ref int bucket = ref GetBucketRef(view, hashCode);
         int index = bucket - 1;
 
         while ((uint)index < (uint)entries.Length)
         {
-            if (entries[index].HashCode == hashCode && 
-                comparer.Equals(entries[index].Key, key))
+            ref var entry = ref entries[index];
+            if (entry.HashCode == hashCode && 
+                comparer.Equals(entry.Key, key))
             {
-                return ref entries[index].Value;
+                return ref entry.Value;
             }
-            index = entries[index].Next;
+            index = entry.Next;
         }
 
         throw new KeyNotFoundException();
@@ -391,42 +412,18 @@ public static class DictionaryExtensions
     private static void InitializeDictionary<TKey, TValue>(Dictionary<TKey, TValue> dictionary, int capacity)
         where TKey : notnull
     {
-        // 这里需要调用字典的初始化方法
-        // 由于是内部方法，我们可以通过添加然后立即删除一个虚拟元素来触发初始化
         if (dictionary.Count == 0)
         {
-            try
-            {
-                // 尝试添加一个虚拟键值对来触发初始化
-                if (typeof(TKey) == typeof(string))
-                {
-                    object dummyKey = "__dummy_init_key__";
-                    dictionary.Add((TKey)dummyKey, default!);
-                    dictionary.Remove((TKey)dummyKey);
-                }
-                else if (typeof(TKey).IsValueType)
-                {
-                    TKey dummyKey = default!;
-                    dictionary.Add(dummyKey, default!);
-                    dictionary.Remove(dummyKey);
-                }
-            }
-            catch
-            {
-                // 如果虚拟键添加失败，回退到设置容量
-                dictionary.EnsureCapacity(Math.Max(capacity, 4));
-            }
+            dictionary.EnsureCapacity(Math.Max(capacity, 4));
         }
     }
 
     private static void ResizeDictionary<TKey, TValue>(Dictionary<TKey, TValue> dictionary, int newSize = 0, bool forceNewHashCodes = false)
         where TKey : notnull
     {
-        // 通过公共API触发调整大小
-        int newCapacity = newSize == 0 ? dictionary.Count * 2 : newSize;
+        int newCapacity = newSize == 0 ? HashHelpers.ExpandPrime(dictionary.Count) : newSize;
         dictionary.EnsureCapacity(newCapacity);
         
-        // 如果需要强制新哈希码（字符串随机化），我们需要重新计算所有条目的哈希码
         if (forceNewHashCodes)
         {
             var view = LuminCollectionMarshal.GetDictionaryView(dictionary);
@@ -437,26 +434,52 @@ public static class DictionaryExtensions
             {
                 if (entries[i].Next >= -1)
                 {
-                    entries[i].HashCode = comparer.GetHashCode(entries[i].Key);
+                    entries[i].HashCode = (uint)comparer.GetHashCode(entries[i].Key);
+                }
+            }
+            
+            Array.Clear(view._buckets, 0,  view._buckets.Length);
+            for (int i = 0; i < view._count; i++)
+            {
+                if (entries[i].Next >= -1)
+                {
+                    ref int bucket = ref GetBucketRef(view, entries[i].HashCode);
+                    entries[i].Next = bucket - 1;
+                    bucket = i + 1;
                 }
             }
         }
     }
 }
 
-public interface IAlternateEqualityComparer<TAlternateKey, TKey>
+internal static class HashHelpers
 {
-    int GetHashCode(TAlternateKey key);
-    bool Equals(TAlternateKey alternateKey, TKey dictionaryKey);
-    TKey Create(TAlternateKey alternateKey);
-}
-
-public class NonRandomizedStringEqualityComparer : IAlternateEqualityComparer<string, string>
-{
-    public int GetHashCode(string key) => key?.GetHashCode() ?? 0;
+    public static int ExpandPrime(int oldSize)
+    {
+        int newSize = 2 * oldSize;
+        if ((uint)newSize > 0x7FEFFFFD)
+        {
+            return 0x7FEFFFFD;
+        }
+        return GetPrime(newSize);
+    }
     
-    public bool Equals(string alternateKey, string dictionaryKey) 
-        => string.Equals(alternateKey, dictionaryKey, StringComparison.Ordinal);
+    static int[] primes = {
+        3, 7, 11, 17, 23, 29, 37, 47, 59, 71, 89, 107, 131, 163, 197, 239, 293, 353, 431, 521, 631, 761, 919,
+        1103, 1327, 1597, 1931, 2333, 2801, 3371, 4049, 4861, 5839, 7013, 8419, 10103, 12143, 14591,
+        17519, 21023, 25229, 30293, 36353, 43627, 52361, 62851, 75431, 90523, 108631, 130363, 156437,
+        187751, 225307, 270371, 324449, 389357, 467237, 560689, 672827, 807403, 968897, 1162687, 1395263,
+        1674319, 2009191, 2411033, 2893249, 3471899, 4166287, 4999559, 5999471, 7199369
+    };
     
-    public string Create(string alternateKey) => alternateKey;
+    public static int GetPrime(int min)
+    {
+        foreach (ref int prime in primes.AsSpan())
+        {
+            if (prime >= min)
+                return prime;
+        }
+        
+        return min;
+    }
 }
